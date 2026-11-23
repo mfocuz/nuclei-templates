@@ -1,0 +1,136 @@
+name: Sync Upstream
+
+# Keeps this fork current with projectdiscovery/nuclei-templates while
+# replaying your local commits on top (rebase). On conflicts, opens a PR.
+
+on:
+  schedule:
+    # Daily 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Apply upstream via rebase (your commits on top) or merge"
+        required: true
+        default: rebase
+        type: choice
+        options:
+          - rebase
+          - merge
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history required for a correct rebase
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/projectdiscovery/nuclei-templates.git
+          git fetch upstream main
+
+      - name: Compare with upstream
+        id: status
+        run: |
+          AHEAD=$(git rev-list --count upstream/main..HEAD)
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "Custom commits ahead of upstream: ${AHEAD}"
+          echo "Upstream commits not in this branch: ${BEHIND}"
+          if [ "${BEHIND}" = "0" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fast-forward (no local commits)
+        if: steps.status.outputs.needed == 'true' && steps.status.outputs.ahead == '0'
+        run: |
+          git merge --ff-only upstream/main
+          git push origin HEAD:main
+          echo "Fast-forwarded main to upstream/main"
+
+      - name: Rebase local commits onto upstream
+        id: rebase
+        if: >-
+          steps.status.outputs.needed == 'true' &&
+          steps.status.outputs.ahead != '0' &&
+          (github.event_name != 'workflow_dispatch' || github.event.inputs.strategy == 'rebase')
+        run: |
+          if git rebase upstream/main; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Rebase conflicts — opening a PR for manual resolution"
+          fi
+
+      - name: Push rebased main
+        if: steps.rebase.outputs.ok == 'true'
+        run: |
+          # Rebase rewrites history of your custom commits; lease keeps it safer
+          git push --force-with-lease origin HEAD:main
+          echo "Rebased ${{ steps.status.outputs.ahead }} custom commit(s) onto upstream/main"
+
+      - name: Merge upstream into main
+        id: merge
+        if: >-
+          steps.status.outputs.needed == 'true' &&
+          steps.status.outputs.ahead != '0' &&
+          (github.event.inputs.strategy == 'merge' || steps.rebase.outputs.ok == 'false')
+        run: |
+          BRANCH="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit upstream/main; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            git push origin HEAD:main
+            echo "Merged upstream/main into main"
+          else
+            git merge --abort
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            # Publish a branch that is exactly upstream so GitHub can show conflicts in a PR
+            git branch "${BRANCH}" upstream/main
+            git push origin "${BRANCH}"
+          fi
+
+      - name: Open PR when sync needs manual resolution
+        if: steps.merge.outputs.conflicts == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          TITLE="chore: sync upstream nuclei-templates ($(date -u +%Y-%m-%d))"
+          BODY="$(cat <<'EOF'
+          ## Upstream sync needs manual resolution
+
+          Automatic rebase onto `projectdiscovery/nuclei-templates` (`main`) hit conflicts with your local edits.
+
+          ### What to do
+          1. Open this PR and resolve conflicts in the GitHub UI (or locally).
+          2. Prefer keeping **your** intentional template changes when both sides edited the same file.
+          3. Merge the PR when green.
+
+          After merge, future sync runs should succeed again until the next overlapping edit.
+          EOF
+          )"
+          gh pr create --base main --head "${BRANCH}" --title "${TITLE}" --body "${BODY}" \
+            || gh pr list --head "${BRANCH}" --json url --jq '.[0].url'
